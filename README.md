@@ -32,15 +32,14 @@ uninstallers via Wine when available, and helps safely clean leftover files and 
 - Presents a numbered interactive menu for selecting multiple applications to remove.
 - Runs uninstallers via `wine` (supports msiexec and standard uninstall executables), or offers safe manual directory removal when no uninstaller is available.
 - Removes Wine-created `.desktop` entries under `~/.local/share/applications/wine/Programs` when matching names are found.
-- Attempts a clean shutdown of Wine services (`wineserver -k`) after removals to avoid stale state.
+./wine-apps-uninstaller.sh  # or the full path
 
 ## Requirements
 - Linux (Arch / Arch-based recommended but not required)
 - `wine` (the script uses `wine` to run uninstallers)
-- Standard POSIX utilities: `find`, `sed`, `awk`, `grep`, `du`
 
 The script must be run as a normal user (do NOT run as root). It operates on files inside your home directory.
-
+./wine-apps-uninstaller.sh
 ## Usage
 
 Make the script executable and run it from your shell:
@@ -57,9 +56,9 @@ Basic flow:
 - Enter numbers (space-separated) for the apps you want to remove.
 - Confirm, then the script will run each app's uninstaller (if available) or offer to delete the install folder.
 
-Important safety notes:
-- Do not run as `root`. The script is designed to operate on user prefixes.
-- The script asks for confirmation before running uninstallers or deleting directories.
+> [!NOTE]
+> - Do not run as `root`. The script is designed to operate on user prefixes.
+> - The script asks for confirmation before running uninstallers or deleting directories.
 
 ## Examples
 
