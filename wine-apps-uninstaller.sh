@@ -2,12 +2,17 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# Interactive Wine apps uninstaller
-# Author: github.com/galpt
-# Sources: https://wiki.archlinux.org/title/Wine
-#          https://gitlab.winehq.org/wine/wine/-/wikis/home
-
 PROG_NAME=$(basename "$0")
+
+DRY_RUN=0
+PREFIX_OVERRIDE=""
+PREFIX=""
+
+PREFIXES=()
+APPS=()
+TO_REMOVE=()
+
+declare -A SIZE_CACHE=()
 
 _green() { printf "\033[1;32m%s\033[0m\n" "$*"; }
 _yellow() { printf "\033[1;33m%s\033[0m\n" "$*"; }
@@ -21,453 +26,680 @@ print_header() {
 │                    Author: github.com/galpt            │
 └────────────────────────────────────────────────────────┘
 
-This helper scans common Wine prefixes for installed Windows programs,
-offers an interactive selection menu, runs their uninstallers when
-available, and safely removes leftover files and desktop entries.
+This helper scans Wine prefixes for installed Windows programs,
+offers an interactive selection menu, runs uninstallers when
+available, and helps clean leftover files and desktop entries.
 
 HEADER
 }
 
-require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "$(_red "ERROR"): required command '$1' not found."; exit 1; } }
+usage() {
+  cat <<USAGE
+Usage: $PROG_NAME [options]
+
+Options:
+  --dry-run       Show what would be removed without changing anything
+  --prefix PATH   Inspect a specific Wine prefix directly
+  --help          Show this help
+
+Examples:
+  ./$PROG_NAME
+  ./$PROG_NAME --dry-run
+  ./$PROG_NAME --prefix "\$HOME/.wine"
+USAGE
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    _red "Required command '$1' was not found."
+    exit 1
+  fi
+}
 
 ensure_prereqs() {
   require_cmd wine
-  require_cmd find
-  require_cmd sed
   require_cmd awk
+  require_cmd find
   require_cmd grep
+  require_cmd readlink
+  require_cmd sed
+  require_cmd sort
 }
 
 check_not_root() {
   if [ "$EUID" -eq 0 ]; then
-    _red "Do NOT run this script as root. Exiting."; exit 1
+    _red "Do not run this script as root."
+    exit 1
   fi
+}
+
+parse_flags() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --prefix)
+        shift
+        if [ "$#" -eq 0 ]; then
+          _red "--prefix requires a path."
+          exit 1
+        fi
+        PREFIX_OVERRIDE=$1
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        _red "Unknown option: $1"
+        usage
+        exit 1
+        ;;
+    esac
+    shift
+  done
+}
+
+contains_text() {
+  local haystack=$1
+  local needle=$2
+
+  grep -Fqi -- "$needle" <<< "$haystack"
+}
+
+is_valid_prefix() {
+  local candidate=$1
+
+  [ -d "$candidate" ] || return 1
+  [ -d "$candidate/drive_c" ] || return 1
+
+  if [ -f "$candidate/system.reg" ] || [ -f "$candidate/user.reg" ] || [ -d "$candidate/dosdevices" ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+add_prefix() {
+  local candidate=$1
+  local existing
+
+  if ! is_valid_prefix "$candidate"; then
+    return 0
+  fi
+
+  for existing in "${PREFIXES[@]}"; do
+    if [ "$existing" = "$candidate" ]; then
+      return 0
+    fi
+  done
+
+  PREFIXES+=("$candidate")
+  return 0
 }
 
 find_prefixes() {
   PREFIXES=()
-  # If user set WINEPREFIX, prefer it
-  if [ -n "${WINEPREFIX-}" ] && [ -d "${WINEPREFIX}" ]; then
-    PREFIXES+=("${WINEPREFIX}")
+
+  if [ -n "$PREFIX_OVERRIDE" ]; then
+    add_prefix "$PREFIX_OVERRIDE"
+    return 0
   fi
-  # default prefix
-  if [ -d "$HOME/.wine" ]; then
-    PREFIXES+=("$HOME/.wine")
+
+  if [ -n "${WINEPREFIX:-}" ]; then
+    add_prefix "$WINEPREFIX"
   fi
-  # common winetricks/wineprefixes dir
+
+  add_prefix "$HOME/.wine"
+
   if [ -d "$HOME/.local/share/wineprefixes" ]; then
-    while IFS= read -r p; do PREFIXES+=("$p"); done < <(find "$HOME/.local/share/wineprefixes" -maxdepth 1 -mindepth 1 -type d -print 2>/dev/null)
+    while IFS= read -r prefix_path; do
+      add_prefix "$prefix_path"
+    done < <(find "$HOME/.local/share/wineprefixes" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort -f)
   fi
-  # fallback: search for drive_c directories under home (fast, limited depth)
-  while IFS= read -r d; do
-    p=${d%/drive_c}
-    PREFIXES+=("$p")
+
+  while IFS= read -r drive_c_dir; do
+    add_prefix "${drive_c_dir%/drive_c}"
   done < <(find "$HOME" -maxdepth 4 -type d -name drive_c -print 2>/dev/null | sort -u)
 
-  # unique
-  mapfile -t PREFIXES < <(printf "%s\n" "${PREFIXES[@]:-}" | awk '!x[$0]++')
+  return 0
 }
 
 show_prefix_menu() {
+  local i=1
+
   echo
   echo "Detected Wine prefixes:"
-  i=1
-  for p in "${PREFIXES[@]}"; do
-    echo "  $i) $p"
+  for prefix_path in "${PREFIXES[@]}"; do
+    echo "  $i) $prefix_path"
     ((i++))
   done
   echo
 }
 
 prompt_select_prefix() {
+  if [ "${#PREFIXES[@]}" -eq 1 ]; then
+    PREFIX=${PREFIXES[0]}
+    _green "Using prefix: $PREFIX"
+    return 0
+  fi
+
   while true; do
     read -rp "Select prefix number to inspect (or 'q' to quit): " sel
-    [[ "$sel" =~ ^[Qq]$ ]] && echo "Aborted." && exit 0
+    if [[ "$sel" =~ ^[Qq]$ ]]; then
+      echo "Aborted."
+      exit 0
+    fi
     if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#PREFIXES[@]}" ]; then
       PREFIX="${PREFIXES[$((sel-1))]}"
-      echo
       _green "Selected prefix: $PREFIX"
-      break
+      return 0
     fi
-    echo "Invalid selection — try again."
+    _yellow "Invalid selection. Try again."
   done
 }
 
-winereg_parse_uninstall() {
-  # Parse system.reg and user.reg looking for keys under *\\Uninstall\\*
-  local prefix=$1
-  declare -A entry_name
-  declare -A entry_uninstall
-  declare -A entry_location
-  local idx=0
+parse_registry_value() {
+  local line=$1
+  local value=${line#*=}
 
-  for regfile in "$prefix/system.reg" "$prefix/user.reg"; do
+  if [[ $value =~ ^\"(.*)\"$ ]]; then
+    value=${BASH_REMATCH[1]}
+  fi
+
+  value=${value//\\\\/\\}
+  value=${value//\\\"/\"}
+  value=${value//\\r/}
+  value=${value//\\n/ }
+
+  printf '%s\n' "$value"
+}
+
+winereg_parse_uninstall() {
+  local prefix_path=$1
+  local regfile
+  local line
+  local current_key=""
+  local in_uninstall=0
+  local display_name=""
+  local uninstall_string=""
+  local install_location=""
+  local -a entries=()
+
+  for regfile in "$prefix_path/system.reg" "$prefix_path/user.reg"; do
     [ -r "$regfile" ] || continue
+
     current_key=""
     in_uninstall=0
+    display_name=""
+    uninstall_string=""
+    install_location=""
+
     while IFS= read -r line || [ -n "$line" ]; do
       if [[ $line =~ ^\[(.*)\]$ ]]; then
-        current_key="${BASH_REMATCH[1]}"
-        if [[ "$current_key" =~ \\Uninstall\\ ]]; then
+        if [ "$in_uninstall" -eq 1 ] && [ -n "$display_name" ]; then
+          entries+=("$display_name|$uninstall_string|$install_location")
+        fi
+
+        current_key=${BASH_REMATCH[1]}
+        display_name=""
+        uninstall_string=""
+        install_location=""
+
+        if [[ "$current_key" == *\\Uninstall\\* ]]; then
           in_uninstall=1
         else
           in_uninstall=0
         fi
         continue
       fi
-      if [ "$in_uninstall" -eq 1 ] && [[ $line =~ ^\"([^\"]+)\"= ]]; then
-        keyname="${BASH_REMATCH[1]}"
-        # extract value after = and strip surrounding quotes
-        val=$(echo "$line" | sed -E 's/^"[^"]+"=.?(.+)$/\1/')
-        # if value is a quoted string like "Foo" strip quotes and trailing\n
-        if [[ $val =~ ^\"(.*)\"$ ]]; then
-          val="${BASH_REMATCH[1]}"
-        fi
-        case "$keyname" in
-          DisplayName) entry_name[$idx]="$val" ;;
-          UninstallString) entry_uninstall[$idx]="$val" ;;
-          InstallLocation) entry_location[$idx]="$val" ;;
-        esac
-      fi
-      # If we've collected a DisplayName for current key and next key begins, store it
-      # We'll push when a new key starts or at EOF; simple approach: when we encounter a new key
-      if [ "$in_uninstall" -eq 0 ] && [ -n "${entry_name[$idx]-}" ]; then
-        ((idx++))
-      fi
+
+      [ "$in_uninstall" -eq 1 ] || continue
+
+      case "$line" in
+        \"DisplayName\"=*)
+          display_name=$(parse_registry_value "$line")
+          ;;
+        \"UninstallString\"=*)
+          uninstall_string=$(parse_registry_value "$line")
+          ;;
+        \"InstallLocation\"=*)
+          install_location=$(parse_registry_value "$line")
+          ;;
+      esac
     done < "$regfile"
-    # end file: increment idx to allow further entries
-    if [ -n "${entry_name[$idx]-}" ]; then ((idx++)); fi
+
+    if [ "$in_uninstall" -eq 1 ] && [ -n "$display_name" ]; then
+      entries+=("$display_name|$uninstall_string|$install_location")
+    fi
   done
 
-  # Output consolidated list: index|name|uninstall|location
-  for i in "${!entry_name[@]}"; do
-    echo "$i|${entry_name[$i]:-}|${entry_uninstall[$i]:-}|${entry_location[$i]:-}"
-  done | sort -t'|' -k2,2
+  if [ "${#entries[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  printf '%s\n' "${entries[@]}" \
+    | awk -F'|' 'NF && !seen[tolower($1 FS $2 FS $3)]++' \
+    | sort -t'|' -f -k1,1
+
+  return 0
 }
 
 win_path_to_unix() {
-  # Convert a Windows-style path in a registry value to a UNIX path inside the prefix
-  local prefix=$1 value=$2
-  # remove surrounding quotes
-  value=${value#\"}; value=${value%\"}
-  # remove leading C:\ or c:\
-  value=${value#C:}
-  value=${value#c:}
-  # replace backslashes with /
-  value=${value//\\/\/}
-  # remove leading leading slash if any
-  value=${value#/}
-  printf "%s/drive_c/%s" "$prefix" "$value"
+  local prefix_path=$1
+  local value=$2
+  local drive_letter
+  local rest
+  local dosdevice
+  local target
+
+  value=${value#\"}
+  value=${value%\"}
+
+  if [[ $value =~ ^([A-Za-z]):\\(.*)$ ]]; then
+    drive_letter=${BASH_REMATCH[1],,}
+    rest=${BASH_REMATCH[2]//\\/\/}
+    dosdevice="$prefix_path/dosdevices/${drive_letter}:"
+
+    if [ -e "$dosdevice" ]; then
+      target=$(readlink -f "$dosdevice" 2>/dev/null || true)
+      if [ -n "$target" ]; then
+        printf '%s/%s\n' "$target" "$rest"
+        return 0
+      fi
+    fi
+
+    printf '%s/drive_c/%s\n' "$prefix_path" "$rest"
+    return 0
+  fi
+
+  if [[ $value = /* ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_install_path() {
+  local prefix_path=$1
+  local loc=$2
+
+  if [ -z "$loc" ]; then
+    return 1
+  fi
+
+  if [ -e "$loc" ]; then
+    printf '%s\n' "$loc"
+    return 0
+  fi
+
+  if win_path_to_unix "$prefix_path" "$loc" >/dev/null 2>&1; then
+    win_path_to_unix "$prefix_path" "$loc"
+    return 0
+  fi
+
+  return 1
 }
 
 size_for_location() {
-  local prefix=$1 loc=$2
-  if [ -z "$loc" ]; then
-    echo "?"
-    return
+  local prefix_path=$1
+  local loc=$2
+  local resolved
+
+  if ! resolved=$(resolve_install_path "$prefix_path" "$loc"); then
+    printf '?\n'
+    return 0
   fi
-  # Convert possible Windows path
-  unixp=$(win_path_to_unix "$prefix" "$loc")
-  if [ -e "$unixp" ]; then
-    du -sh "$unixp" 2>/dev/null | awk '{print $1}' || echo "?"
+
+  if [ -n "${SIZE_CACHE[$resolved]:-}" ]; then
+    printf '%s\n' "${SIZE_CACHE[$resolved]}"
+    return 0
+  fi
+
+  if [ -e "$resolved" ]; then
+    SIZE_CACHE[$resolved]=$(du -sh "$resolved" 2>/dev/null | awk '{print $1}')
   else
-    echo "?"
+    SIZE_CACHE[$resolved]="?"
   fi
+
+  printf '%s\n' "${SIZE_CACHE[$resolved]}"
 }
 
 collect_apps() {
+  local line
+  local name
+  local uninstall_string
+  local install_location
+  local fallback_entry
+  local -a fallback_entries=()
+
   APPS=()
-  mapfile -t raw < <(winereg_parse_uninstall "$PREFIX")
-  for line in "${raw[@]}"; do
-    IFS='|' read -r idx name unstr loc <<< "$line"
-    [ -z "$name" ] && continue
-    # prefer readable name; if contains REG_SZ markers, remove them
-    name=$(echo "$name" | sed -E 's/^\s+|\s+$//g')
-    APPS+=("$idx|$name|$unstr|$loc")
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS='|' read -r name uninstall_string install_location <<< "$line"
+    name=$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<< "$name")
+    [ -n "$name" ] || continue
+    APPS+=("$name|$uninstall_string|$install_location")
+  done < <(winereg_parse_uninstall "$PREFIX")
+
+  if [ "${#APPS[@]}" -gt 0 ]; then
+    return 0
+  fi
+
+  for program_dir in "$PREFIX/drive_c/Program Files" "$PREFIX/drive_c/Program Files (x86)"; do
+    [ -d "$program_dir" ] || continue
+    while IFS= read -r child_dir; do
+      fallback_entries+=("$(basename "$child_dir")||$child_dir")
+    done < <(find "$program_dir" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort -f)
   done
 
-  # If no apps found via registry, fall back to scanning Program Files
-  if [ "${#APPS[@]}" -eq 0 ]; then
-    # look for top-level directories in drive_c/Program Files*
-    for d in "$PREFIX/drive_c/Program Files" "$PREFIX/drive_c/Program Files (x86)"; do
-      if [ -d "$d" ]; then
-        while IFS= read -r p; do
-          nm=$(basename "$p")
-          APPS+=("-1|$nm||$p")
-        done < <(find "$d" -maxdepth 1 -mindepth 1 -type d -printf '%p\n' 2>/dev/null)
-      fi
-    done
+  if [ "${#fallback_entries[@]}" -eq 0 ]; then
+    return 0
   fi
+
+  while IFS= read -r fallback_entry; do
+    [ -n "$fallback_entry" ] || continue
+    APPS+=("$fallback_entry")
+  done < <(printf '%s\n' "${fallback_entries[@]}" | awk -F'|' 'NF && !seen[tolower($1 FS $3)]++' | sort -t'|' -f -k1,1)
+
+  return 0
 }
 
 show_apps_menu() {
+  local i=1
+  local entry
+  local name
+  local uninstall_string
+  local install_location
+  local size
+  local method
+
   echo
   echo "Installed applications in prefix: $PREFIX"
-  printf "%3s %-40s %-8s %s\n" "#" "Name" "Size" "Method"
-  echo "--------------------------------------------------------------------------------"
-  i=1
-  for e in "${APPS[@]}"; do
-    IFS='|' read -r aid name unstr loc <<< "$e"
-    if [ -n "$loc" ]; then size=$(size_for_location "$PREFIX" "$loc"); else size="?"; fi
-    method="manual"
-    if [ -n "$unstr" ]; then method="uninstall"; fi
-    printf "%3s %-40s %-8s %s\n" "$i" "${name:0:40}" "$size" "$method"
+  printf "%3s %-42s %-8s %s\n" "#" "Name" "Size" "Method"
+  printf '%s\n' "--------------------------------------------------------------------------------"
+
+  for entry in "${APPS[@]}"; do
+    IFS='|' read -r name uninstall_string install_location <<< "$entry"
+    size=$(size_for_location "$PREFIX" "$install_location")
+    if [ -n "$uninstall_string" ]; then
+      method="uninstaller"
+    elif [ -n "$install_location" ]; then
+      method="folder"
+    else
+      method="unknown"
+    fi
+    printf "%3s %-42s %-8s %s\n" "$i" "${name:0:42}" "$size" "$method"
     ((i++))
   done
+
   echo
 }
 
 prompt_select_apps() {
-  read -rp "Enter numbers to remove (space-separated), or 'q' to quit: " sel
-  [[ "$sel" =~ ^[Qq]$ ]] && echo "Aborted." && exit 0
-  # parse numbers
+  local token
+  local -a parsed_tokens=()
+  local -A seen=()
+
+  read -rp "Enter numbers to remove (space- or comma-separated), or 'q' to quit: " sel
+  if [[ "$sel" =~ ^[Qq]$ ]]; then
+    echo "Aborted."
+    exit 0
+  fi
+
+  sel=${sel//,/ }
   TO_REMOVE=()
-  for token in $sel; do
+  IFS=' ' read -r -a parsed_tokens <<< "$sel"
+
+  for token in "${parsed_tokens[@]}"; do
     if [[ "$token" =~ ^[0-9]+$ ]] && [ "$token" -ge 1 ] && [ "$token" -le "${#APPS[@]}" ]; then
-      TO_REMOVE+=("$((token-1))")
+      if [ -z "${seen[$token]:-}" ]; then
+        TO_REMOVE+=("$((token-1))")
+        seen[$token]=1
+      fi
     fi
   done
+
   if [ "${#TO_REMOVE[@]}" -eq 0 ]; then
-    _yellow "No valid selections made. Exiting."; exit 0
+    _yellow "No valid selections were made."
+    exit 0
   fi
+}
+
+run_command() {
+  local description=$1
+  shift
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _yellow "(dry-run) $description"
+    return 0
+  fi
+
+  if ! "$@"; then
+    _yellow "Command failed: $description"
+  fi
+}
+
+safe_remove_path() {
+  local target=$1
+  local resolved_target
+  local resolved_prefix
+
+  if [ ! -e "$target" ]; then
+    return 0
+  fi
+
+  resolved_target=$(readlink -f "$target" 2>/dev/null || true)
+  resolved_prefix=$(readlink -f "$PREFIX" 2>/dev/null || true)
+
+  if [ -z "$resolved_target" ] || [ -z "$resolved_prefix" ]; then
+    _yellow "Skipping unresolved path: $target"
+    return 0
+  fi
+
+  if [[ "$resolved_target" != "$resolved_prefix"/* ]] || [ "$resolved_target" = "$resolved_prefix" ]; then
+    _yellow "Skipping path outside the selected prefix: $resolved_target"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _yellow "(dry-run) rm -rf -- $resolved_target"
+    return 0
+  fi
+
+  rm -rf -- "$resolved_target"
 }
 
 remove_desktop_entries() {
-  local name="$1"
-  # Wine menu desktop entries live under ~/.local/share/applications/wine/Programs
-  local wine_apps_dir="$HOME/.local/share/applications/wine/Programs"
-  if [ -d "$wine_apps_dir" ]; then
-    # remove files matching the program name (case-insensitive)
-    shopt -s nullglob
-    for f in "$wine_apps_dir"/*; do
-      if echo "$(basename "$f")" | grep -iq "${name}"; then
-        _yellow "Removing desktop entry: $f"
-        rm -f "$f" || true
+  local app_name=$1
+  local wine_apps_root="$HOME/.local/share/applications/wine/Programs"
+  local desktop_root="$HOME/Desktop"
+  local desktop_file
+  local shortcut
+
+  if [ -d "$wine_apps_root" ]; then
+    while IFS= read -r -d '' desktop_file; do
+      if contains_text "$(basename "$desktop_file")" "$app_name" || contains_text "$(cat "$desktop_file" 2>/dev/null || true)" "$app_name"; then
+        _yellow "Removing desktop entry: $desktop_file"
+        if [ "$DRY_RUN" -eq 0 ]; then
+          rm -f -- "$desktop_file"
+        fi
       fi
-    done
-    shopt -u nullglob
+    done < <(find "$wine_apps_root" -type f -name '*.desktop' -print0 2>/dev/null)
   fi
+
+  if [ -d "$desktop_root" ]; then
+    while IFS= read -r -d '' shortcut; do
+      if contains_text "$(basename "$shortcut")" "$app_name" || contains_text "$(cat "$shortcut" 2>/dev/null || true)" "$app_name"; then
+        _yellow "Removing desktop shortcut: $shortcut"
+        if [ "$DRY_RUN" -eq 0 ]; then
+          rm -f -- "$shortcut"
+        fi
+      fi
+    done < <(find "$desktop_root" -maxdepth 1 -type f \( -name '*.desktop' -o -name '*.lnk' \) -print0 2>/dev/null)
+  fi
+
+  return 0
 }
 
-remove_wine_file_associations() {
-  _green "Cleaning Wine file associations and icons (may require sudo for system locations)."
-  # Remove wine extension desktop files
-  rm -f "$HOME/.local/share/applications/wine-extension*.desktop" || true
-  rm -f "$HOME/.local/share/applications/wine-extension*" || true
+remove_menu_dirs() {
+  local app_name=$1
+  local wine_apps_root="$HOME/.local/share/applications/wine/Programs"
+  local dir_path
 
-  # Remove leftover wine menu files
-  rm -f "$HOME/.local/share/applications/wine-*.desktop" || true
-  rm -f "$HOME/.local/share/applications/wine-*.menu" || true
-  rm -f "$HOME/.config/menus/wine-*.menu" || true
+  [ -d "$wine_apps_root" ] || return 0
 
-  # Remove wine menu dirs
-  if [ -d "$HOME/.local/share/applications/wine" ]; then
-    # if directory empty after removals, remove it
-    rmdir --ignore-fail-on-non-empty "$HOME/.local/share/applications/wine" 2>/dev/null || true
-  fi
-
-  # Remove icons and mime packages created by Wine
-  rm -f "$HOME/.local/share/icons/hicolor/*/*/application-x-wine-extension*" 2>/dev/null || true
-  rm -f "$HOME/.local/share/mime/packages/x-wine*" 2>/dev/null || true
-  rm -f "$HOME/.local/share/mime/application/x-wine-extension*" 2>/dev/null || true
-
-  # Remove desktop shortcuts on Desktop that mention the app name
-  if [ -d "$HOME/Desktop" ]; then
-    shopt -s nullglob
-    # remove .desktop wrappers
-    for f in "$HOME/Desktop"/*.desktop; do
-      if grep -qi "${1}" "$f" 2>/dev/null || echo "$(basename "$f")" | grep -iq "${1}"; then
-        _yellow "Removing desktop shortcut: $f"
-        rm -f "$f" || true
+  while IFS= read -r -d '' dir_path; do
+    if contains_text "$(basename "$dir_path")" "$app_name"; then
+      _yellow "Removing menu directory: $dir_path"
+      if [ "$DRY_RUN" -eq 0 ]; then
+        rm -rf -- "$dir_path"
       fi
-    done
-    # remove Windows .lnk shortcuts that may appear on the Desktop
-    if command -v find >/dev/null 2>&1; then
-      find "$HOME/Desktop" -maxdepth 1 -type f \( -iname "*${1}*.lnk" -o -iname "*.lnk" \) -print0 | while IFS= read -r -d '' lf; do
-        # only remove .lnk files that contain the program name or look like Wine links
-        if echo "$(basename "$lf")" | grep -iq "${1}" || grep -qi "wine" <<< "$(basename "$lf")"; then
-          _yellow "Removing Windows .lnk shortcut: $lf"
-          rm -f "$lf" || true
-        fi
-      done
     fi
-    shopt -u nullglob
+  done < <(find "$wine_apps_root" -mindepth 1 -type d -print0 2>/dev/null)
+
+  return 0
+}
+
+prune_empty_wine_dirs() {
+  local apps_root="$HOME/.local/share/applications/wine"
+
+  if [ -d "$apps_root" ] && [ "$DRY_RUN" -eq 0 ]; then
+    find "$apps_root" -depth -type d -empty -delete 2>/dev/null || true
   fi
 
-  # Clear cached desktop/mime info so menus update
-  if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
-  fi
-  if command -v update-mime-database >/dev/null 2>&1; then
-    update-mime-database "$HOME/.local/share/mime" 2>/dev/null || true
+  return 0
+}
+
+refresh_local_caches() {
+  if [ -d "$HOME/.local/share/applications" ] && command -v update-desktop-database >/dev/null 2>&1; then
+    run_command "update-desktop-database ~/.local/share/applications" update-desktop-database "$HOME/.local/share/applications"
   fi
 
-  # Update icon cache if available
+  if [ -d "$HOME/.local/share/mime" ] && command -v update-mime-database >/dev/null 2>&1; then
+    run_command "update-mime-database ~/.local/share/mime" update-mime-database "$HOME/.local/share/mime"
+  fi
+
   if [ -d "$HOME/.local/share/icons/hicolor" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+    run_command "gtk-update-icon-cache -f ~/.local/share/icons/hicolor" gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor"
   fi
+
+  return 0
 }
 
-find_system_artifacts() {
-  local name="$1"
-  SYSTEM_ARTIFACTS=()
-  # common system locations to check
-  local -a patterns=(
-    "/usr/share/applications/wine*"
-    "/usr/local/share/applications/wine*"
-    "/usr/share/applications/*wine*.desktop"
-    "/usr/local/share/applications/*wine*.desktop"
-    "/usr/share/icons/hicolor/*/*/application-x-wine-extension*"
-    "/usr/local/share/icons/hicolor/*/*/application-x-wine-extension*"
-    "/usr/share/mime/packages/x-wine*"
-    "/usr/local/share/mime/packages/x-wine*"
-  )
-
-  for pat in "${patterns[@]}"; do
-    for f in $pat; do
-      [ -e "$f" ] || continue
-      # if name provided, match it in basename
-      if [ -n "$name" ]; then
-        if echo "$(basename "$f")" | grep -iq "$name"; then
-          SYSTEM_ARTIFACTS+=("$f")
-        else
-          # also include generic wine artifacts
-          if echo "$(basename "$f")" | grep -iq "wine"; then
-            SYSTEM_ARTIFACTS+=("$f")
-          fi
-        fi
-      else
-        SYSTEM_ARTIFACTS+=("$f")
-      fi
-    done
-  done
-  # dedupe
-  if [ "${#SYSTEM_ARTIFACTS[@]}" -gt 0 ]; then
-    mapfile -t SYSTEM_ARTIFACTS < <(printf "%s\n" "${SYSTEM_ARTIFACTS[@]}" | awk '!x[$0]++')
+wait_for_wine() {
+  if command -v wineserver >/dev/null 2>&1; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      _yellow "(dry-run) wineserver -w"
+      return 0
+    fi
+    env WINEPREFIX="$PREFIX" wineserver -w || true
   fi
+
+  return 0
 }
 
-run_privileged_cleanup() {
-  local -a items=("${SYSTEM_ARTIFACTS[@]:-}")
-  [ "${#items[@]}" -gt 0 ] || return 0
-  echo
-  _yellow "The following system-wide files were detected and require root to remove:"
-  for p in "${items[@]}"; do echo "  $p"; done
-  read -rp "Remove these system files using sudo? [y/N]: " ok
-  if ! [[ "$ok" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-    _yellow "Skipping system-wide cleanup."; return 0
+maybe_remove_leftover_install_dir() {
+  local app_name=$1
+  local install_location=$2
+  local resolved_path
+
+  if ! resolved_path=$(resolve_install_path "$PREFIX" "$install_location"); then
+    return 0
   fi
 
-  # ask for sudo upfront
-  if ! sudo -v; then
-    _red "sudo authentication failed or was cancelled. Skipping privileged cleanup."; return 0
+  if [ ! -e "$resolved_path" ]; then
+    return 0
   fi
 
-  for p in "${items[@]}"; do
-    sudo rm -rf -- "$p" || _yellow "Failed to remove $p (continuing)"
-  done
+  read -rp "Remove leftover install directory '$resolved_path' for '$app_name'? [y/N]: " answer
+  if [[ "$answer" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    safe_remove_path "$resolved_path" || _yellow "Failed to remove $resolved_path"
+  fi
 
-  # refresh system caches if utilities exist
-  if command -v update-desktop-database >/dev/null 2>&1 && [ -d "/usr/share/applications" ]; then
-    sudo update-desktop-database "/usr/share/applications" 2>/dev/null || true
-  fi
-  if command -v update-mime-database >/dev/null 2>&1 && [ -d "/usr/share/mime" ]; then
-    sudo update-mime-database "/usr/share/mime" 2>/dev/null || true
-  fi
-  if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -d "/usr/share/icons/hicolor" ]; then
-    sudo gtk-update-icon-cache -f "/usr/share/icons/hicolor" 2>/dev/null || true
-  fi
+  return 0
 }
 
-tidy_leftovers() {
-  local name="$1"
-  # Remove any wine program folders under .local/share/applications/wine/Programs matching name
-  local wine_apps_dir="$HOME/.local/share/applications/wine/Programs"
-  if [ -d "$wine_apps_dir" ]; then
-    shopt -s nullglob
-    for d in "$wine_apps_dir"/*; do
-      if echo "$(basename "$d")" | grep -iq "${name}"; then
-        _yellow "Removing wine program menu dir: $d"
-        rm -rf "$d" || true
-      fi
-    done
-    shopt -u nullglob
+run_uninstaller() {
+  local app_name=$1
+  local uninstall_string=$2
+
+  _yellow "Uninstall command found: $uninstall_string"
+  read -rp "Run uninstaller for '$app_name'? [y/N]: " answer
+  if ! [[ "$answer" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    _yellow "Skipped uninstaller for $app_name"
+    return 0
   fi
 
-  # Remove any leftover installer directories under ~/.local/share/icons or package metadata
-  remove_wine_file_associations "$name"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _yellow "(dry-run) WINEPREFIX=\"$PREFIX\" wine cmd /c \"$uninstall_string\""
+    return 0
+  fi
+
+  if ! env WINEPREFIX="$PREFIX" wine cmd /c "$uninstall_string"; then
+    _yellow "Uninstaller exited with a non-zero status."
+  fi
+
+  return 0
 }
 
 run_uninstall() {
-  local entry="$1" # idx|name|unstr|loc
-  IFS='|' read -r id name unstr loc <<< "$entry"
-  _green "Processing: $name"
-  if [ -n "$unstr" ]; then
-    # prefer to run uninstall string via wine with WINEPREFIX
-    _yellow "Uninstall command found: $unstr"
-    read -rp "Run uninstaller for '$name'? [y/N]: " ans
-    if ! [[ "$ans" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-      _yellow "Skipping uninstaller for $name"
-    else
-      # prepare command: if it contains msiexec or starts with a quoted path
-      if echo "$unstr" | grep -qi "msiexec"; then
-        # pass through to wine msiexec
-        _green "Running: wine msiexec $unstr"
-        env WINEPREFIX="$PREFIX" wine $unstr || _yellow "Uninstaller exited with non-zero status"
+  local entry=$1
+  local app_name
+  local uninstall_string
+  local install_location
+  local resolved_path
+
+  IFS='|' read -r app_name uninstall_string install_location <<< "$entry"
+  _green "Processing: $app_name"
+
+  if [ -n "$uninstall_string" ]; then
+    run_uninstaller "$app_name" "$uninstall_string"
+    wait_for_wine
+    maybe_remove_leftover_install_dir "$app_name" "$install_location"
+  elif [ -n "$install_location" ]; then
+    if resolved_path=$(resolve_install_path "$PREFIX" "$install_location"); then
+      _yellow "No uninstaller was found. Candidate directory: $resolved_path"
+      read -rp "Delete this directory now? [y/N]: " answer
+      if [[ "$answer" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        safe_remove_path "$resolved_path" || _yellow "Failed to remove $resolved_path"
       else
-        # often it's a quoted Windows path with optional args
-        # extract exe path and args
-        exe=$(echo "$unstr" | awk '{print $1}')
-        args=$(echo "$unstr" | cut -s -d' ' -f2- || true)
-        unix_exe=$(win_path_to_unix "$PREFIX" "$exe")
-        if [ -x "$unix_exe" ] || [ -f "$unix_exe" ]; then
-          _green "Running: wine '$unix_exe' $args"
-          env WINEPREFIX="$PREFIX" wine "$unix_exe" $args || _yellow "Uninstaller exited with non-zero status"
-        else
-          # try using wine start with the Windows path
-          _green "Running: wine start /unix '$exe' $args"
-          env WINEPREFIX="$PREFIX" wine start /unix "$exe" $args || _yellow "Uninstaller exited with non-zero status"
-        fi
+        _yellow "Skipped manual removal for $app_name"
       fi
+    else
+      _yellow "No usable uninstall information for $app_name."
     fi
   else
-    # No uninstall string — attempt manual directory removal
-    if [ -n "$loc" ]; then
-      unixp=$loc
-      # If loc looks like Windows path, convert
-      if [[ "$loc" =~ \\ ]]; then
-        unixp=$(win_path_to_unix "$PREFIX" "$loc")
-      fi
-      _yellow "No uninstaller found. Consider removing: $unixp"
-      read -rp "Delete directory '$unixp' now? [y/N]: " ans2
-      if [[ "$ans2" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        rm -rf "$unixp" || _yellow "Failed to remove $unixp"
-      else
-        _yellow "Skipped manual removal for $name"
-      fi
-    else
-      _yellow "No uninstall information for $name — nothing to do."
-    fi
+    _yellow "No uninstall information for $app_name."
   fi
 
-  # Attempt to remove desktop entries for this program name
-  remove_desktop_entries "$name"
-  tidy_leftovers "$name"
-
-  # Try to tidy up wineserver state
-  if command -v wineserver >/dev/null 2>&1; then
-    env WINEPREFIX="$PREFIX" wineserver -k || true
-  fi
+  remove_desktop_entries "$app_name"
+  remove_menu_dirs "$app_name"
+  prune_empty_wine_dirs
+  return 0
 }
 
 main() {
+  parse_flags "$@"
   check_not_root
   ensure_prereqs
   print_header
 
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _yellow "Running in dry-run mode. No files or prefixes will be modified."
+  fi
+
   find_prefixes
+  if [ -n "$PREFIX_OVERRIDE" ] && [ "${#PREFIXES[@]}" -eq 0 ]; then
+    _red "The path given to --prefix is not a valid Wine prefix: $PREFIX_OVERRIDE"
+    exit 1
+  fi
   if [ "${#PREFIXES[@]}" -eq 0 ]; then
-    _red "No Wine prefixes found under your home directory. Exiting."; exit 1
+    _red "No Wine prefixes were found."
+    exit 1
   fi
 
   show_prefix_menu
@@ -475,31 +707,25 @@ main() {
 
   collect_apps
   if [ "${#APPS[@]}" -eq 0 ]; then
-    _yellow "No installed applications detected in this prefix. Exiting."; exit 0
+    _yellow "No installed applications were detected in this prefix."
+    exit 0
   fi
 
   show_apps_menu
   prompt_select_apps
 
-  # Confirm one more time
-  read -rp "Confirm uninstall of ${#TO_REMOVE[@]} selected apps? [y/N]: " final
-  if ! [[ "$final" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-    _yellow "Aborted by user."; exit 0
+  read -rp "Confirm uninstall of ${#TO_REMOVE[@]} selected app(s)? [y/N]: " final_answer
+  if ! [[ "$final_answer" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    _yellow "Aborted by user."
+    exit 0
   fi
 
-  for idx in "${TO_REMOVE[@]}"; do
-    entry="${APPS[$idx]}"
-    run_uninstall "$entry"
+  for app_index in "${TO_REMOVE[@]}"; do
+    run_uninstall "${APPS[$app_index]}"
   done
 
-  _green "Done. If desktop menu items linger, run:"
-  _green "  update-desktop-database ~/.local/share/applications || true"
+  refresh_local_caches
+  _green "Done."
 }
-
-if [ "${1-}" = "--help" ] || [ "${1-}" = "-h" ]; then
-  print_header
-  echo
-  echo "Usage: $PROG_NAME"; exit 0
-fi
 
 main "$@"
